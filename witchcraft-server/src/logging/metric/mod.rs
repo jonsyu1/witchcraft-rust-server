@@ -70,54 +70,70 @@ where
     let phase = Duration::from_nanos(salt % bucket_period.as_nanos() as u64);
     // Give service initialization time to register metrics before the first snapshot.
     let mut next_bucket_deadline = Instant::now() + LOG_INTERVAL + phase;
+    if report_gauges_until(&mut gauge_reporter, &mut appender, next_bucket_deadline)
+        .await
+        .is_err()
+    {
+        return;
+    }
 
-    for next_bucket in (0..BUCKET_COUNT).cycle() {
-        if report_gauges_until(&mut gauge_reporter, &mut appender, next_bucket_deadline)
-            .await
-            .is_err()
-        {
-            return;
-        }
+    loop {
+        fill_buckets(&metrics, &mut lazy_reporter, &mut buckets, salt);
 
-        if next_bucket == 0 {
-            let snapshot = metrics.metrics();
-            lazy_reporter.start_cycle(&snapshot, Utc::now());
-            for (id, metric) in &snapshot {
-                buckets[bucket_index(id, salt)].push((id.clone(), metric.clone()));
-            }
-        }
-
-        for (id, metric) in buckets[next_bucket].drain(..) {
-            if let Metric::Gauge(m) = &metric {
-                if !gauge_reporter.insert(&id, m) {
-                    warn!(
-                        "Gauge is still executing from the last report cycle and will be skipped to avoid \
-                         overloading the system",
-                        safe: { gaugeName: metrics::safe_metric_name_with_tags(&id) }
-                    );
-                }
-                continue;
-            }
-
-            for log in lazy_reporter
-                .prepare_logs(&id, &metric, Utc::now())
-                .into_iter()
-                .flatten()
+        for bucket in &mut buckets {
+            if report_gauges_until(&mut gauge_reporter, &mut appender, next_bucket_deadline)
+                .await
+                .is_err()
             {
-                if let Err(Closed) = appender.feed(log).await {
-                    return;
+                return;
+            }
+
+            for (id, metric) in bucket.drain(..) {
+                if let Metric::Gauge(m) = &metric {
+                    if !gauge_reporter.insert(&id, m) {
+                        warn!(
+                            "Gauge is still executing from the last report cycle and will be skipped to avoid \
+                             overloading the system",
+                            safe: { gaugeName: metrics::safe_metric_name_with_tags(&id) }
+                        );
+                    }
+                    continue;
+                }
+
+                for log in lazy_reporter
+                    .prepare_logs(&id, &metric, Utc::now())
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Err(Closed) = appender.feed(log).await {
+                        return;
+                    }
                 }
             }
-        }
 
-        next_bucket_deadline += bucket_period;
-        let now = Instant::now();
-        if next_bucket_deadline <= now {
-            // Skip elapsed deadlines in one step, keeping the original phase.
-            let periods_to_skip =
-                (now - next_bucket_deadline).as_nanos() / bucket_period.as_nanos() + 1;
-            next_bucket_deadline += bucket_period * u32::try_from(periods_to_skip).unwrap();
+            next_bucket_deadline += bucket_period;
+            let now = Instant::now();
+            if next_bucket_deadline <= now {
+                // Skip elapsed deadlines in one step, keeping the original phase.
+                let periods_to_skip =
+                    (now - next_bucket_deadline).as_nanos() / bucket_period.as_nanos() + 1;
+                next_bucket_deadline += bucket_period * u32::try_from(periods_to_skip).unwrap();
+            }
         }
+    }
+}
+
+/// Starts a reporting cycle from a snapshot of the registered metrics.
+fn fill_buckets(
+    metrics: &MetricRegistry,
+    lazy_reporter: &mut LazyMetricReporter,
+    buckets: &mut [Vec<(MetricId, Metric)>; BUCKET_COUNT],
+    salt: u64,
+) {
+    let snapshot = metrics.metrics();
+    lazy_reporter.start_cycle(&snapshot, Utc::now());
+    for (id, metric) in &snapshot {
+        buckets[bucket_index(id, salt)].push((id.clone(), metric.clone()));
     }
 }
 
@@ -309,12 +325,13 @@ mod test {
     async fn snapshots_membership_but_reads_values_at_emission() {
         let registry = Arc::new(MetricRegistry::new());
         let removed_id = id_in_bucket("removed", 10);
-        let removed = registry.counter(removed_id.clone());
         let added_id = id_in_bucket("added", 20);
         let appender = TestAppender::default();
         let reporter = run_metric_reporter(appender.clone(), registry.clone(), SALT);
         tokio::pin!(reporter);
         assert!(poll!(&mut reporter).is_pending());
+        // Metrics registered during startup must be included in the first snapshot.
+        let removed = registry.counter(removed_id.clone());
         time::advance(first_report_delay()).await;
         assert!(poll!(&mut reporter).is_pending());
 
