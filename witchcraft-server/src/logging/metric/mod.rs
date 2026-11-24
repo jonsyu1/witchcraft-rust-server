@@ -110,12 +110,14 @@ where
             }
         }
 
-        // Keep the original phase, skipping elapsed ticks so delays cannot trigger catch-up bursts.
+        next_bucket_deadline += bucket_period;
         let now = Instant::now();
-        let elapsed = now.saturating_duration_since(next_bucket_deadline);
-        let remainder =
-            Duration::from_nanos((elapsed.as_nanos() % bucket_period.as_nanos()) as u64);
-        next_bucket_deadline = now + bucket_period - remainder;
+        if next_bucket_deadline <= now {
+            // Skip elapsed deadlines in one step, keeping the original phase.
+            let periods_to_skip =
+                (now - next_bucket_deadline).as_nanos() / bucket_period.as_nanos() + 1;
+            next_bucket_deadline += bucket_period * u32::try_from(periods_to_skip).unwrap();
+        }
     }
 }
 
@@ -356,10 +358,14 @@ mod test {
         assert!(poll!(&mut reporter).is_pending());
         assert_eq!(appender.0.lock().logs.len(), 1);
 
-        time::advance(Duration::from_secs(300)).await;
+        time::advance(Duration::from_secs(300) + BUCKET_PERIOD / 2).await;
         assert!(poll!(&mut reporter).is_pending());
         assert_eq!(appender.0.lock().logs.len(), 2);
-        time::advance(BUCKET_PERIOD).await;
+        // The next bucket keeps its original phase rather than waiting a full period after the stall.
+        time::advance(BUCKET_PERIOD / 2 - Duration::from_millis(1)).await;
+        assert!(poll!(&mut reporter).is_pending());
+        assert_eq!(appender.0.lock().logs.len(), 2);
+        time::advance(Duration::from_millis(1)).await;
         assert!(poll!(&mut reporter).is_pending());
         assert_eq!(appender.0.lock().logs.len(), 3);
     }
