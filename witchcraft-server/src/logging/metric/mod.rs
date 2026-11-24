@@ -67,9 +67,8 @@ where
     let mut lazy_reporter = LazyMetricReporter::default();
     let mut buckets: [Vec<(MetricId, Metric)>; BUCKET_COUNT] = std::array::from_fn(|_| Vec::new());
     let bucket_period = LOG_INTERVAL / BUCKET_COUNT as u32;
-    let phase = Duration::from_nanos(salt % bucket_period.as_nanos() as u64);
     // Give service initialization time to register metrics before the first snapshot.
-    let mut next_bucket_deadline = Instant::now() + LOG_INTERVAL + phase;
+    let mut next_bucket_deadline = Instant::now() + LOG_INTERVAL;
     if report_gauges_until(&mut gauge_reporter, &mut appender, next_bucket_deadline)
         .await
         .is_err()
@@ -114,7 +113,7 @@ where
             next_bucket_deadline += bucket_period;
             let now = Instant::now();
             if next_bucket_deadline <= now {
-                // Skip elapsed deadlines in one step, keeping the original phase.
+                // Skip elapsed deadlines in one step, keeping the original schedule.
                 let periods_to_skip =
                     (now - next_bucket_deadline).as_nanos() / bucket_period.as_nanos() + 1;
                 next_bucket_deadline += bucket_period * u32::try_from(periods_to_skip).unwrap();
@@ -257,10 +256,6 @@ mod test {
         }
     }
 
-    fn first_report_delay() -> Duration {
-        LOG_INTERVAL + Duration::from_nanos(SALT % BUCKET_PERIOD.as_nanos() as u64)
-    }
-
     fn id_in_bucket(name: &'static str, bucket: usize) -> MetricId {
         (0..)
             .map(|index| MetricId::new(name).with_tag("endpoint", index.to_string()))
@@ -284,7 +279,7 @@ mod test {
         tokio::pin!(reporter);
         assert!(poll!(&mut reporter).is_pending());
 
-        time::advance(first_report_delay() - Duration::from_millis(1)).await;
+        time::advance(LOG_INTERVAL - Duration::from_millis(1)).await;
         assert!(poll!(&mut reporter).is_pending());
         assert!(appender.0.lock().logs.is_empty());
         time::advance(Duration::from_millis(1)).await;
@@ -297,10 +292,7 @@ mod test {
             let state = appender.0.lock();
             assert_eq!(state.logs.len(), bucket + 1);
             let (time, log) = &state.logs[bucket];
-            assert_eq!(
-                *time,
-                start + first_report_delay() + BUCKET_PERIOD * bucket as u32
-            );
+            assert_eq!(*time, start + LOG_INTERVAL + BUCKET_PERIOD * bucket as u32);
             let id = id_in_bucket("server.response", bucket);
             assert_eq!(
                 log.tags().get("endpoint").map(String::as_str),
@@ -332,7 +324,7 @@ mod test {
         assert!(poll!(&mut reporter).is_pending());
         // Metrics registered during startup must be included in the first snapshot.
         let removed = registry.counter(removed_id.clone());
-        time::advance(first_report_delay()).await;
+        time::advance(LOG_INTERVAL).await;
         assert!(poll!(&mut reporter).is_pending());
 
         removed.add(7);
@@ -371,14 +363,14 @@ mod test {
         let reporter = run_metric_reporter(appender.clone(), registry_with_every_bucket(), SALT);
         tokio::pin!(reporter);
         assert!(poll!(&mut reporter).is_pending());
-        time::advance(first_report_delay()).await;
+        time::advance(LOG_INTERVAL).await;
         assert!(poll!(&mut reporter).is_pending());
         assert_eq!(appender.0.lock().logs.len(), 1);
 
         time::advance(Duration::from_secs(300) + BUCKET_PERIOD / 2).await;
         assert!(poll!(&mut reporter).is_pending());
         assert_eq!(appender.0.lock().logs.len(), 2);
-        // The next bucket keeps its original phase rather than waiting a full period after the stall.
+        // The next bucket stays on the original schedule after the stall.
         time::advance(BUCKET_PERIOD / 2 - Duration::from_millis(1)).await;
         assert!(poll!(&mut reporter).is_pending());
         assert_eq!(appender.0.lock().logs.len(), 2);
@@ -393,7 +385,7 @@ mod test {
         let reporter = run_metric_reporter(appender.clone(), registry_with_every_bucket(), SALT);
         tokio::pin!(reporter);
         assert!(poll!(&mut reporter).is_pending());
-        time::advance(first_report_delay()).await;
+        time::advance(LOG_INTERVAL).await;
         assert!(poll!(&mut reporter).is_pending());
         appender.0.lock().blocked = true;
         time::advance(BUCKET_PERIOD).await;
@@ -422,7 +414,7 @@ mod test {
         let reporter = run_metric_reporter(appender.clone(), registry_with_every_bucket(), SALT);
         tokio::pin!(reporter);
         assert!(poll!(&mut reporter).is_pending());
-        time::advance(first_report_delay()).await;
+        time::advance(LOG_INTERVAL).await;
         assert!(poll!(&mut reporter).is_pending());
         appender.close();
         assert!(poll!(&mut reporter).is_ready());
@@ -453,7 +445,7 @@ mod test {
         let reporter = run_metric_reporter(appender.clone(), registry, SALT);
         tokio::pin!(reporter);
         assert!(poll!(&mut reporter).is_pending());
-        time::advance(first_report_delay()).await;
+        time::advance(LOG_INTERVAL).await;
         assert!(poll!(&mut reporter).is_pending());
         running.await.unwrap();
 
