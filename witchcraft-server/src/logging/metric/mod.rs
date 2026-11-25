@@ -111,13 +111,6 @@ where
             }
 
             next_bucket_deadline += bucket_period;
-            let now = Instant::now();
-            if next_bucket_deadline <= now {
-                // Skip elapsed deadlines in one step, keeping the original schedule.
-                let periods_to_skip =
-                    (now - next_bucket_deadline).as_nanos() / bucket_period.as_nanos() + 1;
-                next_bucket_deadline += bucket_period * u32::try_from(periods_to_skip).unwrap();
-            }
         }
     }
 }
@@ -358,7 +351,7 @@ mod test {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn runtime_stalls_do_not_cause_catch_up_bursts() {
+    async fn runtime_stalls_catch_up_to_reporting_schedule() {
         let appender = TestAppender::default();
         let reporter = run_metric_reporter(appender.clone(), registry_with_every_bucket(), SALT);
         tokio::pin!(reporter);
@@ -367,20 +360,20 @@ mod test {
         assert!(poll!(&mut reporter).is_pending());
         assert_eq!(appender.0.lock().logs.len(), 1);
 
-        time::advance(Duration::from_secs(300) + BUCKET_PERIOD / 2).await;
+        time::advance(BUCKET_PERIOD * 2 + BUCKET_PERIOD / 2).await;
         assert!(poll!(&mut reporter).is_pending());
-        assert_eq!(appender.0.lock().logs.len(), 2);
+        assert_eq!(appender.0.lock().logs.len(), 3);
         // The next bucket stays on the original schedule after the stall.
         time::advance(BUCKET_PERIOD / 2 - Duration::from_millis(1)).await;
         assert!(poll!(&mut reporter).is_pending());
-        assert_eq!(appender.0.lock().logs.len(), 2);
+        assert_eq!(appender.0.lock().logs.len(), 3);
         time::advance(Duration::from_millis(1)).await;
         assert!(poll!(&mut reporter).is_pending());
-        assert_eq!(appender.0.lock().logs.len(), 3);
+        assert_eq!(appender.0.lock().logs.len(), 4);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn appender_backpressure_does_not_cause_catch_up_bursts() {
+    async fn appender_backpressure_catches_up_to_reporting_schedule() {
         let appender = TestAppender::default();
         let reporter = run_metric_reporter(appender.clone(), registry_with_every_bucket(), SALT);
         tokio::pin!(reporter);
@@ -392,13 +385,13 @@ mod test {
         assert!(poll!(&mut reporter).is_pending());
         assert_eq!(appender.0.lock().logs.len(), 1);
 
-        time::advance(Duration::from_secs(300)).await;
+        time::advance(BUCKET_PERIOD * 2).await;
         appender.unblock();
         assert!(poll!(&mut reporter).is_pending());
-        assert_eq!(appender.0.lock().logs.len(), 2);
+        assert_eq!(appender.0.lock().logs.len(), 4);
         time::advance(BUCKET_PERIOD).await;
         assert!(poll!(&mut reporter).is_pending());
-        assert_eq!(appender.0.lock().logs.len(), 3);
+        assert_eq!(appender.0.lock().logs.len(), 5);
     }
 
     #[tokio::test(start_paused = true)]
